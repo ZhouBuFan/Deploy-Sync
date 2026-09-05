@@ -1,0 +1,228 @@
+{
+  "name": "deploy-sync",
+  "displayName": "Deploy Sync",
+  "description": "保存文件后自动同步到指定目录（如挂载的网络盘 /Volumes/your-server），类似 IDEA 的 Deployment 功能",
+  "version": "0.0.1",
+  "publisher": "local",
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "deploySync.uploadCurrentFile",
+        "title": "Deploy Sync: 上传当前文件",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "deploySync.uploadWorkspace",
+        "title": "Deploy Sync: 上传整个项目"
+      },
+      {
+        "command": "deploySync.uploadChangedFiles",
+        "title": "Deploy Sync: 上传未提交的更改",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "deploySync.refreshChanges",
+        "title": "Deploy Sync: 刷新更改列表",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "deploySync.compareWithRemote",
+        "title": "Deploy Sync: 与目标文件比较",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "deploySync.compareWorkspace",
+        "title": "Deploy Sync: 比较差异（本地 ↔ 目标）",
+        "icon": "$(diff-multiple)"
+      },
+      {
+        "command": "deploySync.toggleUploadOnSave",
+        "title": "Deploy Sync: 开启/关闭保存自动上传"
+      },
+      {
+        "command": "deploySync.configureTarget",
+        "title": "Deploy Sync: 配置同步映射（本地 → 目标）"
+      },
+      {
+        "command": "deploySync.showLog",
+        "title": "Deploy Sync: 查看日志"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "deploySync.uploadCurrentFile",
+          "group": "deploySync@1",
+          "when": "resourceScheme == file"
+        },
+        {
+          "command": "deploySync.compareWithRemote",
+          "group": "deploySync@2",
+          "when": "resourceScheme == file && !explorerResourceIsFolder"
+        },
+        {
+          "command": "deploySync.compareWorkspace",
+          "group": "deploySync@3",
+          "when": "resourceScheme == file && explorerResourceIsFolder"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "deploySync.uploadCurrentFile",
+          "group": "deploySync@1"
+        },
+        {
+          "command": "deploySync.compareWithRemote",
+          "group": "deploySync@2"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "deploySync.uploadChangedFiles",
+          "when": "view == deploySync.changes",
+          "group": "navigation@1"
+        },
+        {
+          "command": "deploySync.compareWorkspace",
+          "when": "view == deploySync.changes",
+          "group": "navigation@2"
+        },
+        {
+          "command": "deploySync.refreshChanges",
+          "when": "view == deploySync.changes",
+          "group": "navigation@3"
+        },
+        {
+          "command": "deploySync.configureTarget",
+          "when": "view == deploySync.changes",
+          "group": "1_config@1"
+        },
+        {
+          "command": "deploySync.toggleUploadOnSave",
+          "when": "view == deploySync.changes",
+          "group": "1_config@2"
+        },
+        {
+          "command": "deploySync.uploadWorkspace",
+          "when": "view == deploySync.changes",
+          "group": "1_config@3"
+        },
+        {
+          "command": "deploySync.showLog",
+          "when": "view == deploySync.changes",
+          "group": "1_config@4"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "deploySync.uploadCurrentFile",
+          "when": "view == deploySync.changes && viewItem == deploySyncChange",
+          "group": "inline@1"
+        },
+        {
+          "command": "deploySync.compareWithRemote",
+          "when": "view == deploySync.changes && viewItem == deploySyncChange",
+          "group": "inline@2"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "deploySync",
+          "title": "Deploy Sync",
+          "icon": "media/sidebar.svg"
+        }
+      ]
+    },
+    "views": {
+      "deploySync": [
+        {
+          "id": "deploySync.changes",
+          "name": "未提交的更改",
+          "icon": "media/sidebar.svg"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Deploy Sync",
+      "properties": {
+        "deploySync.mappings": {
+          "type": "array",
+          "default": [],
+          "markdownDescription": "路径映射表。`localRoot` 为相对于工作区根目录的路径（空字符串表示根目录），`remoteRoot` 为目标绝对路径。",
+          "items": {
+            "type": "object",
+            "required": [
+              "remoteRoot"
+            ],
+            "properties": {
+              "localRoot": {
+                "type": "string",
+                "default": "",
+                "description": "本地子目录（相对工作区根目录），留空表示整个工作区"
+              },
+              "remoteRoot": {
+                "type": "string",
+                "description": "目标目录绝对路径，例如 /Volumes/your-server/www/project"
+              }
+            }
+          }
+        },
+        "deploySync.uploadOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "保存文件后自动上传"
+        },
+        "deploySync.syncDeletions": {
+          "type": "boolean",
+          "default": false,
+          "description": "本地删除文件时，同步删除目标目录中的对应文件"
+        },
+        "deploySync.exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/.git/**",
+            "**/node_modules/**",
+            "**/.DS_Store",
+            "**/out/**",
+            "**/dist/**",
+            "**/.idea/**",
+            "**/.vscode/**"
+          ],
+          "description": "不参与同步的 glob 规则"
+        },
+        "deploySync.notifyOnSuccess": {
+          "type": "boolean",
+          "default": false,
+          "description": "单个文件上传成功后弹出提示（默认只写入日志与状态栏）"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "20.14.10",
+    "@types/vscode": "1.85.0",
+    "typescript": "5.5.4"
+  }
+}
