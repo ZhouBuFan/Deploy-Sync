@@ -1,5 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { isDirExcluded } from './config';
 
 /** vscode.git 扩展 API 的最小声明，只取本插件用到的部分 */
 interface GitChange {
@@ -43,12 +44,20 @@ const enum GitStatus {
   INTENT_TO_ADD = 9
 }
 
-export interface ChangeNode {
-  kind: 'change';
+export interface FileNode {
+  kind: 'file';
   resourceUri: vscode.Uri;
   relativePath: string;
   status: number;
   staged: boolean;
+}
+
+export interface FolderNode {
+  kind: 'folder';
+  resourceUri: vscode.Uri;
+  relativePath: string;
+  label: string;
+  children: ChangesNode[];
 }
 
 interface MessageNode {
@@ -56,7 +65,7 @@ interface MessageNode {
   message: string;
 }
 
-export type ChangesNode = ChangeNode | MessageNode;
+export type ChangesNode = FileNode | FolderNode | MessageNode;
 
 function statusLabel(status: number, staged: boolean): string {
   const base = (() => {
@@ -80,8 +89,18 @@ function statusLabel(status: number, staged: boolean): string {
   return staged ? `${base}·已暂存` : base;
 }
 
-function isDeleted(status: number): boolean {
+export function isDeleted(status: number): boolean {
   return status === GitStatus.DELETED || status === GitStatus.INDEX_DELETED;
+}
+
+export function collectFiles(node: ChangesNode): FileNode[] {
+  if (node.kind === 'file') {
+    return [node];
+  }
+  if (node.kind === 'folder') {
+    return node.children.flatMap(collectFiles);
+  }
+  return [];
 }
 
 export class GitChangesProvider implements vscode.TreeDataProvider<ChangesNode> {
@@ -92,6 +111,9 @@ export class GitChangesProvider implements vscode.TreeDataProvider<ChangesNode> 
   private readonly disposables: vscode.Disposable[] = [];
   private readonly repoListeners = new Map<string, vscode.Disposable>();
   private refreshTimer: NodeJS.Timeout | undefined;
+  /** 取消勾选的文件，默认全部勾选 */
+  private readonly unchecked = new Set<string>();
+  private roots: ChangesNode[] = [];
 
   constructor() {
     void this.init();
@@ -152,12 +174,29 @@ export class GitChangesProvider implements vscode.TreeDataProvider<ChangesNode> 
       return item;
     }
 
+    if (node.kind === 'folder') {
+      const item = new vscode.TreeItem(node.label, vscode.TreeItemCollapsibleState.Expanded);
+      const files = collectFiles(node);
+      const excluded = isFolderExcluded(node.resourceUri);
+      item.resourceUri = node.resourceUri;
+      item.iconPath = vscode.ThemeIcon.Folder;
+      item.description = excluded ? `${files.length} 个文件 · 已排除` : `${files.length} 个文件`;
+      item.tooltip = node.resourceUri.fsPath;
+      item.contextValue = excluded ? 'deploySyncFolderExcluded' : 'deploySyncFolder';
+      item.checkboxState = files.every((file) => this.isChecked(file))
+        ? vscode.TreeItemCheckboxState.Checked
+        : vscode.TreeItemCheckboxState.Unchecked;
+      return item;
+    }
+
     const item = new vscode.TreeItem(path.basename(node.relativePath));
-    const dir = path.dirname(node.relativePath);
     item.resourceUri = node.resourceUri;
-    item.description = dir === '.' ? statusLabel(node.status, node.staged) : `${statusLabel(node.status, node.staged)} · ${dir}`;
+    item.description = statusLabel(node.status, node.staged);
     item.tooltip = node.resourceUri.fsPath;
     item.contextValue = isDeleted(node.status) ? 'deploySyncDeleted' : 'deploySyncChange';
+    item.checkboxState = this.isChecked(node)
+      ? vscode.TreeItemCheckboxState.Checked
+      : vscode.TreeItemCheckboxState.Unchecked;
     if (!isDeleted(node.status)) {
       item.command = {
         command: 'vscode.open',
@@ -170,7 +209,7 @@ export class GitChangesProvider implements vscode.TreeDataProvider<ChangesNode> 
 
   getChildren(node?: ChangesNode): ChangesNode[] {
     if (node) {
-      return [];
+      return node.kind === 'folder' ? node.children : [];
     }
     if (!this.api) {
       return [{ kind: 'message', message: '未找到内置 Git 扩展' }];
@@ -178,19 +217,111 @@ export class GitChangesProvider implements vscode.TreeDataProvider<ChangesNode> 
     if (this.api.repositories.length === 0) {
       return [{ kind: 'message', message: '当前项目不是 Git 仓库' }];
     }
-    const changes = this.collect();
-    if (changes.length === 0) {
+    this.roots = this.buildTree();
+    if (this.roots.length === 0) {
       return [{ kind: 'message', message: '没有未提交的更改' }];
     }
-    return changes;
+    return this.roots;
+  }
+
+  /** 勾选状态变化：目录会级联到其下所有文件 */
+  handleCheckboxChange(items: ReadonlyArray<[ChangesNode, vscode.TreeItemCheckboxState]>): void {
+    for (const [node, state] of items) {
+      const checked = state === vscode.TreeItemCheckboxState.Checked;
+      for (const file of collectFiles(node)) {
+        if (checked) {
+          this.unchecked.delete(file.resourceUri.toString());
+        } else {
+          this.unchecked.add(file.resourceUri.toString());
+        }
+      }
+    }
+    this.refresh();
+  }
+
+  setAllChecked(checked: boolean): void {
+    if (checked) {
+      this.unchecked.clear();
+    } else {
+      this.allFiles().forEach((file) => this.unchecked.add(file.resourceUri.toString()));
+    }
+    this.refresh();
+  }
+
+  private isChecked(file: FileNode): boolean {
+    return !this.unchecked.has(file.resourceUri.toString());
+  }
+
+  /** 勾选且可上传（排除已删除）的文件 */
+  checkedFiles(): vscode.Uri[] {
+    return this.allFiles()
+      .filter((file) => this.isChecked(file) && !isDeleted(file.status))
+      .map((file) => file.resourceUri);
+  }
+
+  allFiles(): FileNode[] {
+    return this.buildTree().flatMap(collectFiles);
+  }
+
+  private buildTree(): ChangesNode[] {
+    const changes = this.collect();
+    if (changes.length === 0) {
+      return [];
+    }
+    const multiRepo = new Set(changes.map((c) => c.root)).size > 1;
+    const roots: ChangesNode[] = [];
+
+    for (const root of new Set(changes.map((c) => c.root))) {
+      const rootUri = vscode.Uri.file(root);
+      const folder: FolderNode = {
+        kind: 'folder',
+        resourceUri: rootUri,
+        relativePath: '',
+        label: path.basename(root),
+        children: []
+      };
+      const dirs = new Map<string, FolderNode>();
+      dirs.set('', folder);
+
+      const ensureDir = (relDir: string): FolderNode => {
+        const existing = dirs.get(relDir);
+        if (existing) {
+          return existing;
+        }
+        const parent = ensureDir(path.dirname(relDir) === '.' ? '' : path.dirname(relDir));
+        const node: FolderNode = {
+          kind: 'folder',
+          resourceUri: vscode.Uri.file(path.join(root, relDir)),
+          relativePath: relDir,
+          label: path.basename(relDir),
+          children: []
+        };
+        parent.children.push(node);
+        dirs.set(relDir, node);
+        return node;
+      };
+
+      for (const change of changes.filter((c) => c.root === root)) {
+        const relDir = path.dirname(change.file.relativePath);
+        ensureDir(relDir === '.' ? '' : relDir).children.push(change.file);
+      }
+
+      sortFolder(folder);
+      if (multiRepo) {
+        roots.push(folder);
+      } else {
+        roots.push(...folder.children);
+      }
+    }
+    return roots;
   }
 
   /** 收集所有仓库的未提交更改，同一文件同时存在于暂存区和工作区时只保留一条 */
-  collect(): ChangeNode[] {
+  private collect(): Array<{ root: string; file: FileNode }> {
     if (!this.api) {
       return [];
     }
-    const map = new Map<string, ChangeNode>();
+    const map = new Map<string, { root: string; file: FileNode }>();
     for (const repo of this.api.repositories) {
       const root = repo.rootUri.fsPath;
       const groups: Array<{ list: GitChange[]; staged: boolean }> = [
@@ -206,26 +337,47 @@ export class GitChangesProvider implements vscode.TreeDataProvider<ChangesNode> 
           const key = change.uri.toString();
           const existing = map.get(key);
           if (existing) {
-            existing.staged = existing.staged && group.staged;
+            existing.file.staged = existing.file.staged && group.staged;
             continue;
           }
           map.set(key, {
-            kind: 'change',
-            resourceUri: change.uri,
-            relativePath: path.relative(root, change.uri.fsPath),
-            status: change.status,
-            staged: group.staged
+            root,
+            file: {
+              kind: 'file',
+              resourceUri: change.uri,
+              relativePath: path.relative(root, change.uri.fsPath),
+              status: change.status,
+              staged: group.staged
+            }
           });
         }
       }
     }
-    return [...map.values()].sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+    return [...map.values()];
   }
+}
 
-  /** 可上传的更改文件（排除已删除） */
-  changedFiles(): vscode.Uri[] {
-    return this.collect()
-      .filter((node) => !isDeleted(node.status))
-      .map((node) => node.resourceUri);
+export function isFolderExcluded(uri: vscode.Uri): boolean {
+  const folder = vscode.workspace.getWorkspaceFolder(uri);
+  if (!folder) {
+    return false;
   }
+  const relative = path.relative(folder.uri.fsPath, uri.fsPath);
+  if (relative === '' || relative.startsWith('..')) {
+    return false;
+  }
+  return isDirExcluded(uri, relative);
+}
+
+function sortFolder(folder: FolderNode): void {  folder.children.sort((a, b) => {
+    const aFolder = a.kind === 'folder';
+    const bFolder = b.kind === 'folder';
+    if (aFolder !== bFolder) {
+      return aFolder ? -1 : 1;
+    }
+    const aLabel = a.kind === 'message' ? '' : path.basename(a.relativePath);
+    const bLabel = b.kind === 'message' ? '' : path.basename(b.relativePath);
+    return aLabel.localeCompare(bLabel);
+  });
+  folder.children.filter((child): child is FolderNode => child.kind === 'folder').forEach(sortFolder);
 }

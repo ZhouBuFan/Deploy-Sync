@@ -1,18 +1,18 @@
 import * as path from 'path';
 import * as fs from 'fs/promises';
 import * as vscode from 'vscode';
-import { ChangeNode, GitChangesProvider } from './gitChanges';
-
-interface Mapping {
-  localRoot: string;
-  remoteRoot: string;
-}
-
-interface Target {
-  folder: vscode.WorkspaceFolder;
-  relativePath: string;
-  remotePath: string;
-}
+import {
+  Mapping,
+  excludePatternFor,
+  getConfig,
+  getMappings,
+  isExcluded,
+  normalizeLocalRoot,
+  resolveTarget,
+  updateSetting
+} from './config';
+import { ChangesNode, FolderNode, GitChangesProvider, collectFiles, isDeleted } from './gitChanges';
+import { MappingNode, MappingsProvider } from './mappings';
 
 let output: vscode.OutputChannel;
 let statusBar: vscode.StatusBarItem;
@@ -26,9 +26,19 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const changesProvider = new GitChangesProvider();
   const changesView = vscode.window.createTreeView('deploySync.changes', {
-    treeDataProvider: changesProvider
+    treeDataProvider: changesProvider,
+    showCollapseAll: true,
+    manageCheckboxStateManually: true
   });
-  context.subscriptions.push(changesProvider, changesView);
+  changesView.onDidChangeCheckboxState((event) => changesProvider.handleCheckboxChange(event.items));
+
+  const mappingsProvider = new MappingsProvider(log);
+  const mappingsView = vscode.window.createTreeView('deploySync.mappings', {
+    treeDataProvider: mappingsProvider,
+    dragAndDropController: mappingsProvider
+  });
+
+  context.subscriptions.push(changesProvider, changesView, mappingsProvider, mappingsView);
 
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument(async (doc) => {
@@ -53,10 +63,11 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration('deploySync')) {
         refreshStatusBar();
+        changesProvider.refresh();
       }
     }),
 
-    vscode.commands.registerCommand('deploySync.uploadCurrentFile', async (arg?: vscode.Uri | ChangeNode) => {
+    vscode.commands.registerCommand('deploySync.uploadCurrentFile', async (arg?: vscode.Uri | ChangesNode) => {
       const target = toUri(arg) ?? vscode.window.activeTextEditor?.document.uri;
       if (!target) {
         vscode.window.showWarningMessage('Deploy Sync: 没有可上传的文件');
@@ -78,15 +89,52 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
 
     vscode.commands.registerCommand('deploySync.uploadChangedFiles', async () => {
-      const files = changesProvider.changedFiles();
+      const files = changesProvider.checkedFiles();
       if (files.length === 0) {
-        vscode.window.showInformationMessage('Deploy Sync: 没有未提交的更改');
+        vscode.window.showInformationMessage('Deploy Sync: 没有勾选中的更改文件');
         return;
       }
-      await uploadMany(files, '上传未提交的更改');
+      await uploadMany(files, '上传勾选的更改');
     }),
 
-    vscode.commands.registerCommand('deploySync.refreshChanges', () => changesProvider.refresh()),
+    vscode.commands.registerCommand('deploySync.uploadChangedFolder', async (node?: ChangesNode) => {
+      if (!node) {
+        return;
+      }
+      const files = collectFiles(node)
+        .filter((file) => !isDeleted(file.status))
+        .map((file) => file.resourceUri);
+      if (files.length === 0) {
+        vscode.window.showInformationMessage('Deploy Sync: 该目录没有可上传的更改');
+        return;
+      }
+      await uploadMany(files, '上传目录内的更改');
+    }),
+
+    vscode.commands.registerCommand('deploySync.checkAllChanges', () => changesProvider.setAllChecked(true)),
+
+    vscode.commands.registerCommand('deploySync.uncheckAllChanges', () => changesProvider.setAllChecked(false)),
+
+    vscode.commands.registerCommand('deploySync.refreshChanges', () => {
+      changesProvider.refresh();
+      mappingsProvider.refresh();
+    }),
+
+    vscode.commands.registerCommand('deploySync.excludeFolder', (node?: FolderNode) => toggleExclude(node, true)),
+
+    vscode.commands.registerCommand('deploySync.includeFolder', (node?: FolderNode) => toggleExclude(node, false)),
+
+    vscode.commands.registerCommand('deploySync.removeMapping', async (node?: MappingNode) => {
+      if (node?.kind === 'mapping') {
+        await mappingsProvider.removeMapping(node);
+      }
+    }),
+
+    vscode.commands.registerCommand('deploySync.changeMappingTarget', async (node?: MappingNode) => {
+      if (node?.kind === 'mapping') {
+        await mappingsProvider.changeTarget(node);
+      }
+    }),
 
     vscode.commands.registerCommand('deploySync.toggleUploadOnSave', async () => {
       const config = vscode.workspace.getConfiguration('deploySync');
@@ -96,7 +144,7 @@ export function activate(context: vscode.ExtensionContext): void {
       vscode.window.showInformationMessage(`Deploy Sync: 保存自动上传已${next ? '开启' : '关闭'}`);
     }),
 
-    vscode.commands.registerCommand('deploySync.compareWithRemote', async (arg?: vscode.Uri | ChangeNode) => {
+    vscode.commands.registerCommand('deploySync.compareWithRemote', async (arg?: vscode.Uri | ChangesNode) => {
       const target = toUri(arg) ?? vscode.window.activeTextEditor?.document.uri;
       if (!target) {
         vscode.window.showWarningMessage('Deploy Sync: 没有可比较的文件');
@@ -105,7 +153,7 @@ export function activate(context: vscode.ExtensionContext): void {
       await compareWithRemote(target);
     }),
 
-    vscode.commands.registerCommand('deploySync.compareWorkspace', async (arg?: vscode.Uri | ChangeNode) => {
+    vscode.commands.registerCommand('deploySync.compareWorkspace', async (arg?: vscode.Uri | ChangesNode) => {
       let root = toUri(arg);
       if (!root) {
         root = (await pickFolder())?.uri;
@@ -115,7 +163,10 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }),
 
-    vscode.commands.registerCommand('deploySync.configureTarget', configureTarget),
+    vscode.commands.registerCommand('deploySync.configureTarget', async () => {
+      await configureTarget();
+      mappingsProvider.refresh();
+    }),
 
     vscode.commands.registerCommand('deploySync.showLog', () => output.show(true))
   );
@@ -125,16 +176,36 @@ export function deactivate(): void {
   // 无需清理，资源已挂到 context.subscriptions
 }
 
-function getConfig(resource?: vscode.Uri): vscode.WorkspaceConfiguration {
-  return vscode.workspace.getConfiguration('deploySync', resource);
-}
-
-/** 命令可能来自命令面板、资源管理器右键（Uri）或侧边栏树节点（ChangeNode） */
-function toUri(arg?: vscode.Uri | ChangeNode): vscode.Uri | undefined {
+/** 命令可能来自命令面板、资源管理器右键（Uri）或侧边栏树节点 */
+function toUri(arg?: vscode.Uri | ChangesNode): vscode.Uri | undefined {
   if (!arg) {
     return undefined;
   }
-  return arg instanceof vscode.Uri ? arg : arg.resourceUri;
+  if (arg instanceof vscode.Uri) {
+    return arg;
+  }
+  return arg.kind === 'message' ? undefined : arg.resourceUri;
+}
+
+async function toggleExclude(node: FolderNode | undefined, exclude: boolean): Promise<void> {
+  if (!node || node.kind !== 'folder') {
+    return;
+  }
+  const folder = vscode.workspace.getWorkspaceFolder(node.resourceUri);
+  if (!folder) {
+    return;
+  }
+  const relative = normalizeLocalRoot(path.relative(folder.uri.fsPath, node.resourceUri.fsPath));
+  if (relative === '') {
+    return;
+  }
+  const pattern = excludePatternFor(relative);
+  const patterns = getConfig(folder.uri).get<string[]>('exclude', []);
+  const next = exclude
+    ? [...new Set([...patterns, pattern])]
+    : patterns.filter((p) => p !== pattern && p !== relative);
+  await updateSetting(folder, 'exclude', next);
+  log(`${exclude ? '已排除' : '已取消排除'}：${pattern}`);
 }
 
 function refreshStatusBar(): void {
@@ -158,72 +229,6 @@ async function pickFolder(): Promise<vscode.WorkspaceFolder | undefined> {
     { placeHolder: '选择要同步的项目' }
   );
   return picked?.folder;
-}
-
-function resolveTarget(uri: vscode.Uri): Target | undefined {
-  const folder = vscode.workspace.getWorkspaceFolder(uri);
-  if (!folder) {
-    return undefined;
-  }
-  const relativePath = path.relative(folder.uri.fsPath, uri.fsPath);
-  if (relativePath.startsWith('..')) {
-    return undefined;
-  }
-  const mappings = getConfig(uri).get<Mapping[]>('mappings', []);
-  const candidates = mappings
-    .filter((m) => m.remoteRoot)
-    .map((m) => ({ ...m, localRoot: normalizeLocalRoot(m.localRoot) }))
-    .filter((m) => m.localRoot === '' || relativePath === m.localRoot || relativePath.startsWith(m.localRoot + path.sep))
-    .sort((a, b) => b.localRoot.length - a.localRoot.length);
-
-  const mapping = candidates[0];
-  if (!mapping) {
-    return undefined;
-  }
-  const suffix = mapping.localRoot === '' ? relativePath : path.relative(mapping.localRoot, relativePath);
-  return {
-    folder,
-    relativePath,
-    remotePath: path.join(mapping.remoteRoot, suffix)
-  };
-}
-
-function normalizeLocalRoot(value: string | undefined): string {
-  if (!value) {
-    return '';
-  }
-  return path.normalize(value).replace(/^[./\\]+/, '').replace(/[/\\]+$/, '');
-}
-
-function isExcluded(uri: vscode.Uri, relativePath: string): boolean {
-  const patterns = getConfig(uri).get<string[]>('exclude', []);
-  const posixPath = relativePath.split(path.sep).join('/');
-  return patterns.some((pattern) => globToRegExp(pattern).test(posixPath));
-}
-
-function globToRegExp(pattern: string): RegExp {
-  let source = '';
-  for (let i = 0; i < pattern.length; i++) {
-    const char = pattern[i];
-    if (char === '*') {
-      if (pattern[i + 1] === '*') {
-        i++;
-        if (pattern[i + 1] === '/') {
-          i++;
-          source += '(?:.*/)?';
-        } else {
-          source += '.*';
-        }
-      } else {
-        source += '[^/]*';
-      }
-    } else if (char === '?') {
-      source += '[^/]';
-    } else {
-      source += char.replace(/[.+^${}()|[\]\\]/g, '\\$&');
-    }
-  }
-  return new RegExp(`^${source}$`);
 }
 
 async function uploadFile(uri: vscode.Uri, options: { silent: boolean }): Promise<boolean> {
@@ -287,30 +292,7 @@ async function uploadGlob(root: vscode.Uri, title: string): Promise<void> {
     vscode.window.showInformationMessage('Deploy Sync: 没有需要上传的文件');
     return;
   }
-
-  await vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: `Deploy Sync: ${title}`, cancellable: true },
-    async (progress, token) => {
-      let done = 0;
-      let failed = 0;
-      for (const file of files) {
-        if (token.isCancellationRequested) {
-          break;
-        }
-        const ok = await uploadFile(file, { silent: true });
-        if (ok) {
-          done++;
-        } else {
-          failed++;
-        }
-        progress.report({
-          increment: 100 / files.length,
-          message: `${done + failed}/${files.length}`
-        });
-      }
-      vscode.window.showInformationMessage(`Deploy Sync: 完成 ${done} 个，失败/跳过 ${failed} 个`);
-    }
-  );
+  await uploadMany(files, title);
 }
 
 type DiffState = 'local-only' | 'different' | 'remote-newer';
@@ -475,7 +457,7 @@ async function uploadMany(files: vscode.Uri[], title: string): Promise<void> {
 async function promptMissingMapping(): Promise<void> {
   const choice = await vscode.window.showWarningMessage(
     'Deploy Sync: 还没有配置目标目录',
-    '选择目标目录'
+    '配置同步映射'
   );
   if (choice) {
     await configureTarget();
@@ -532,16 +514,10 @@ async function configureTarget(): Promise<void> {
     return;
   }
   const remoteRoot = pickedRemote[0].fsPath;
-
-  const config = vscode.workspace.getConfiguration('deploySync', folder.uri);
-  const existing = config
-    .get<Mapping[]>('mappings', [])
-    .filter((m) => normalizeLocalRoot(m.localRoot) !== localRoot);
-  await config.update(
-    'mappings',
-    [{ localRoot, remoteRoot }, ...existing],
-    vscode.ConfigurationTarget.WorkspaceFolder
+  const existing: Mapping[] = getMappings(folder.uri).filter(
+    (m) => normalizeLocalRoot(m.localRoot) !== localRoot
   );
+  await updateSetting(folder, 'mappings', [{ localRoot, remoteRoot }, ...existing]);
 
   log(`映射已设置：${localLabel} -> ${remoteRoot}`);
   vscode.window.showInformationMessage(`Deploy Sync: ${localLabel} → ${remoteRoot}`);
